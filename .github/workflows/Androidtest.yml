@@ -289,6 +289,16 @@ jobs:
       contents: write
 
     steps:
+      # gh release create may invoke git to resolve/create the tag. Downloading an
+      # artifact alone does not provide a Git working tree, so check out the exact
+      # source commit used by the successful build before publishing the release.
+      - name: Checkout source commit for release creation
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.build.outputs.commit }}
+          fetch-depth: 0
+          persist-credentials: false
+
       - name: Download signed APK
         uses: actions/download-artifact@v4
         with:
@@ -363,6 +373,7 @@ jobs:
 
           args=(
             release create "$TAG"
+            --repo "$GITHUB_REPOSITORY"
             --target "$COMMIT"
             --title "$TITLE"
             --notes-file "$RUNNER_TEMP/release-notes.md"
