@@ -100,3 +100,51 @@ Changes to the core engine are minimal and guarded by `OperatingSystem.IsAndroid
 - `*.csproj` — multi-target `net8.0;net9.0-android` via `BuildForAndroid` property
 
 Desktop builds are completely unaffected.
+
+## GitHub Actions setup (CI & signed releases)
+
+All Android workflows are **manual-only** (`workflow_dispatch`) — nothing runs on
+`push` or `pull_request`. Run them from the **Actions** tab on the `Main` branch:
+
+- **Android CI** (`.github/workflows/android-ci.yml`) — builds an unsigned Release APK
+  and uploads it as a workflow artifact for testing. Optional `branch` input (default `Main`).
+  Never publishes a Release.
+- **Android Release** (`.github/workflows/android-release.yml`) — builds, signs, verifies
+  and publishes a GitHub Release in one run. Inputs:
+  - `tag_name` — release tag, e.g. `v1.0.0`
+  - `release_name` — release title (defaults to `tag_name`)
+  - `prerelease` — mark as pre-release
+  - `source_branch` — branch to build from (default `Main`)
+
+### Required repository secrets
+
+Add them under **GitHub → Settings → Secrets and variables → Actions → New repository secret**.
+Never paste them into chat, workflow files, or the repository.
+
+| Secret | Expected value |
+|---|---|
+| `ANDROID_KEYSTORE_BASE64` | The release keystore file, Base64-encoded (one line, no `data:` prefix) |
+| `ANDROID_KEYSTORE_PASSWORD` | Keystore password (`keytool --storepass`) |
+| `ANDROID_KEY_ALIAS` | Key alias inside the keystore (`keytool --alias`) |
+| `ANDROID_KEY_PASSWORD` | Password for that specific key (`keytool --keypass`) |
+
+If any of these is missing, the release workflow **stops before building** and explains
+which secret is absent — it will never publish an unsigned APK as an official release.
+
+### Creating a release keystore (only if you don't have one)
+
+```bash
+keytool -genkeypair -v -keystore release.keystore -alias openra-android \
+  -keyalg RSA -keysize 4096 -validity 10000
+base64 -w0 release.keystore   # value for ANDROID_KEYSTORE_BASE64 (macOS: base64 -i release.keystore)
+```
+
+- **Back the keystore up safely (password manager / offline storage) and keep the
+  passwords with it.** An APK can only be updated over Android if the new build is signed
+  with the same key, so **never lose or replace** a keystore that users already have
+  installed builds from.
+- The workflow decodes the keystore into the runner's temp directory with `umask 077`,
+  never logs passwords (GitHub masks secret values), and deletes the temporary files
+  after signing — even when a step fails.
+- Signing uses `zipalign` + `apksigner` (the same mechanism as `thirdparty/deploy-android.sh`)
+  and every release APK is verified with `apksigner verify` before it is uploaded.

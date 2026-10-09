@@ -1,0 +1,182 @@
+name: Android CI
+
+# Manual-only Android build for testing. Run it from the Actions tab on the
+# "Main" branch ("Run workflow") and optionally choose the branch to build.
+# It never publishes a Release - see android-release.yml for signed releases.
+#
+# Facts taken from the actual project files (no guessing):
+#  - OpenRA.Android/OpenRA.Android.csproj: net9.0-android, AndroidPackageFormats=apk,
+#    AndroidNativeLibrary = jniLibs/arm64-v8a/{libfreetype6,liblua51,libsoft_oal}.so
+#  - ANDROID.md + thirdparty/deploy-android.sh: JDK 17, .NET 9 SDK + android workload,
+#    APK output at OpenRA.Android/obj/Release/android/bin/net.openra.android.apk
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch to build'
+        required: true
+        default: 'Main'
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  NATIVE_LIBS_DIR: OpenRA.Android/jniLibs/arm64-v8a
+
+jobs:
+  build:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Validate branch input
+        env:
+          BRANCH: ${{ inputs.branch }}
+        run: |
+          set -euo pipefail
+          if [ -z "${BRANCH}" ]; then
+            echo "::error::Branch input is empty. Choose a branch to build (default: Main)."
+            exit 1
+          fi
+          echo "Building branch: ${BRANCH}"
+
+      - name: Clone Repository
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.branch }}
+
+      - name: Install .NET 9.0
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Install JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Android Workload
+        run: |
+          set -euo pipefail
+          if ! dotnet workload install android; then
+            echo "::error::Failed to install the .NET 'android' workload."
+            exit 1
+          fi
+
+      # Same source as the previous (proven) workflow. These are the exact three
+      # .so files referenced by OpenRA.Android.csproj as AndroidNativeLibrary.
+      - name: Download and extract native libraries from release APK
+        run: |
+          set -euo pipefail
+          mkdir -p "${NATIVE_LIBS_DIR}"
+          if ! wget -q "https://github.com/tarek369/OpenRA/releases/download/v1.0-android/OpenRA-Android-arm64.apk" -O /tmp/release.apk; then
+            echo "::error::Failed to download the native-library APK from tarek369/OpenRA releases."
+            exit 1
+          fi
+          if ! unzip -o /tmp/release.apk \
+            "lib/arm64-v8a/libfreetype6.so" \
+            "lib/arm64-v8a/liblua51.so" \
+            "lib/arm64-v8a/libsoft_oal.so" \
+            -d /tmp/nativelibs; then
+            echo "::error::Failed to extract the expected native libraries from the downloaded APK."
+            exit 1
+          fi
+          mv /tmp/nativelibs/lib/arm64-v8a/*.so "${NATIVE_LIBS_DIR}/"
+          ls -la "${NATIVE_LIBS_DIR}/"
+
+      - name: Verify native libraries
+        run: |
+          set -euo pipefail
+          failed=0
+          for lib in libfreetype6.so liblua51.so libsoft_oal.so; do
+            path="${NATIVE_LIBS_DIR}/${lib}"
+            if [ ! -s "${path}" ]; then
+              echo "::error::Native library ${lib} is missing or empty in ${NATIVE_LIBS_DIR}."
+              failed=1
+              continue
+            fi
+            file "${path}"
+            if ! file "${path}" | grep -q "ELF"; then
+              echo "::error::Native library ${lib} is not an ELF shared object."
+              failed=1
+            elif ! file "${path}" | grep -Eq "aarch64|ARM aarch64"; then
+              echo "::error::Native library ${lib} is not built for arm64-v8a."
+              failed=1
+            fi
+          done
+          if [ "${failed}" -ne 0 ]; then
+            echo "::error::Native library verification failed - aborting the build."
+            exit 1
+          fi
+
+      - name: Build APK (Release)
+        run: |
+          set -euo pipefail
+          if ! dotnet publish OpenRA.Android/OpenRA.Android.csproj \
+            -f net9.0-android -c Release \
+            -p:AndroidPackageFormats=apk \
+            -p:ApplicationVersion=1 \
+            -p:ApplicationDisplayVersion=1.0-fixed \
+            --no-self-contained; then
+            echo "::error::dotnet publish failed for OpenRA.Android (Release, net9.0-android). See the compiler output above."
+            exit 1
+          fi
+
+      # Resolve the produced APK deterministically. Preferred paths are documented
+      # in ANDROID.md / thirdparty/deploy-android.sh; the fallback must find
+      # exactly one APK or the step fails (no random picking).
+      - name: Locate and verify APK
+        run: |
+          set -euo pipefail
+          RESOLVED=""
+          for p in \
+            "OpenRA.Android/obj/Release/android/bin/net.openra.android.apk" \
+            "bin/publish/net.openra.android.apk" \
+            "OpenRA.Android/bin/publish/net.openra.android.apk"; do
+            if [ -s "${p}" ]; then
+              RESOLVED="${p}"
+              break
+            fi
+          done
+          if [ -z "${RESOLVED}" ]; then
+            found=()
+            while IFS= read -r -d '' f; do found+=("${f}"); done \
+              < <(find OpenRA.Android -name '*.apk' -type f -size +0c -print0 2>/dev/null)
+            if [ "${#found[@]}" -eq 1 ]; then
+              RESOLVED="${found[0]}"
+            elif [ "${#found[@]}" -eq 0 ]; then
+              echo "::error::Build succeeded but no non-empty APK was produced."
+              find . -name '*.apk' -type f -print || true
+              exit 1
+            else
+              echo "::error::Ambiguous APK outputs - refusing to pick one at random:"
+              printf '  %s\n' "${found[@]}"
+              exit 1
+            fi
+          fi
+          ls -la "${RESOLVED}"
+
+          ABIS="$(unzip -Z1 "${RESOLVED}" | grep '^lib/' | cut -d/ -f2 | sort -u || true)"
+          if [ -z "${ABIS}" ]; then
+            echo "::error::APK contains no lib/<abi>/ directories - it cannot run on Android."
+            exit 1
+          fi
+          echo "ABIs inside APK:"; echo "${ABIS}"
+          if ! printf '%s\n' "${ABIS}" | grep -qx "arm64-v8a"; then
+            echo "::error::APK does not contain arm64-v8a, the only ABI supported by this project (jniLibs + ANDROID.md)."
+            exit 1
+          fi
+
+          mkdir -p "${RUNNER_TEMP}/ci-apk"
+          cp "${RESOLVED}" "${RUNNER_TEMP}/ci-apk/OpenRA-Android-arm64-v8a-ci.apk"
+          echo "APK_PATH=${RUNNER_TEMP}/ci-apk/OpenRA-Android-arm64-v8a-ci.apk" >> "${GITHUB_ENV}"
+
+      - name: Upload APK artifact (single file, no Release)
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenRA-Android-arm64-v8a-ci
+          path: ${{ env.APK_PATH }}
+          if-no-files-found: error
+          retention-days: 14

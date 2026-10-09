@@ -1,14 +1,10 @@
 name: Continuous Integration
 
+# This workflow is MANUAL-ONLY for this port: it no longer runs automatically on
+# push or pull_request. Trigger it from the Actions tab ("Run workflow").
+# The build/test steps below are unchanged from the previous configuration.
 on:
-  push:
-    paths-ignore:
-      - '*.md'
-  pull_request:
-    branches: [ bleed, 'prep-*' ]
-    paths-ignore:
-      - '*.md'
-      - '*.py'
+  workflow_dispatch:
 
 permissions:
   contents: read  #  to fetch code (actions/checkout)

@@ -1,0 +1,433 @@
+name: Android Release (Sign & Publish)
+
+# Manual-only signed release. Run it from the Actions tab on the "Main" branch.
+# Flow: validate inputs -> build (Release) -> zipalign + apksigner sign with the
+# repository release keystore -> verify signature -> create a GitHub Release and
+# upload the signed APK + SHA-256 checksum.
+#
+# Signing mechanism matches the project's actual tooling
+# (thirdparty/deploy-android.sh uses zipalign + apksigner with a keystore).
+# Required repository secrets (see ANDROID.md "GitHub Actions setup"):
+#   ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD,
+#   ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD
+on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release tag, e.g. v1.0.0'
+        required: true
+        type: string
+      release_name:
+        description: 'Release title (defaults to tag_name)'
+        required: false
+        default: ''
+        type: string
+      prerelease:
+        description: 'Mark this release as a pre-release'
+        required: true
+        default: false
+        type: boolean
+      source_branch:
+        description: 'Branch to build from'
+        required: true
+        default: 'Main'
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  NATIVE_LIBS_DIR: OpenRA.Android/jniLibs/arm64-v8a
+
+jobs:
+  build:
+    name: Build & Sign APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Validate inputs
+        env:
+          TAG: ${{ inputs.tag_name }}
+          BRANCH: ${{ inputs.source_branch }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "${TAG}" | grep -Eq '^[0-9A-Za-z][0-9A-Za-z._-]*$'; then
+            echo "::error::Invalid tag_name '${TAG}'. Allowed: letters, digits, '.', '_', '-' (must start with a letter or digit), e.g. v1.0.0."
+            exit 1
+          fi
+          if [ -z "${BRANCH}" ]; then
+            echo "::error::source_branch is empty. Provide the branch to build from (default: Main)."
+            exit 1
+          fi
+          echo "Tag: ${TAG}"
+          echo "Source branch: ${BRANCH}"
+
+      - name: Check required signing secrets are configured
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          missing=0
+          for v in ANDROID_KEYSTORE_BASE64 ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD; do
+            if [ -z "${!v:-}" ]; then
+              echo "::error::Missing required secret: ${v}. Add it under GitHub -> Settings -> Secrets and variables -> Actions (see ANDROID.md)."
+              missing=1
+            fi
+          done
+          if [ "${missing}" -ne 0 ]; then
+            echo "::error::Release stopped before building: signing secrets are not configured. No unsigned APK will be published."
+            exit 1
+          fi
+          echo "All four signing secrets are present."
+
+      - name: Clone Repository
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_branch }}
+
+      - name: Refuse conflicting tag or release
+        env:
+          TAG: ${{ inputs.tag_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          set +e
+          git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1
+          rc=$?
+          set -e
+          case "${rc}" in
+            0)
+              echo "::error::Tag '${TAG}' already exists on the remote. Refusing to replace it or its assets."
+              exit 1
+              ;;
+            2)
+              echo "Tag '${TAG}' does not exist yet - OK."
+              ;;
+            *)
+              echo "::error::Could not query remote tags (git ls-remote rc=${rc}). Aborting to avoid a conflicting release."
+              exit 1
+              ;;
+          esac
+
+          set +e
+          err="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" 2>&1)"
+          rc=$?
+          set -e
+          if [ "${rc}" -eq 0 ]; then
+            echo "::error::A GitHub Release for '${TAG}' already exists. Refusing to replace it or its assets."
+            exit 1
+          fi
+          if ! printf '%s' "${err}" | grep -q "HTTP 404"; then
+            echo "::error::Could not check existing releases (gh api rc=${rc}): ${err}"
+            exit 1
+          fi
+          echo "No existing release for '${TAG}' - OK."
+
+      - name: Record source commit
+        id: src
+        run: |
+          set -euo pipefail
+          echo "commit=$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
+          echo "Building commit $(git rev-parse HEAD)"
+
+      - name: Install .NET 9.0
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Install JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Android Workload
+        run: |
+          set -euo pipefail
+          if ! dotnet workload install android; then
+            echo "::error::Failed to install the .NET 'android' workload."
+            exit 1
+          fi
+
+      # Same proven source as the CI workflow: exactly the three .so files
+      # referenced by OpenRA.Android.csproj (jniLibs/arm64-v8a/).
+      - name: Download and verify native libraries
+        run: |
+          set -euo pipefail
+          mkdir -p "${NATIVE_LIBS_DIR}"
+          if ! wget -q "https://github.com/tarek369/OpenRA/releases/download/v1.0-android/OpenRA-Android-arm64.apk" -O /tmp/release.apk; then
+            echo "::error::Failed to download the native-library APK from tarek369/OpenRA releases."
+            exit 1
+          fi
+          if ! unzip -o /tmp/release.apk \
+            "lib/arm64-v8a/libfreetype6.so" \
+            "lib/arm64-v8a/liblua51.so" \
+            "lib/arm64-v8a/libsoft_oal.so" \
+            -d /tmp/nativelibs; then
+            echo "::error::Failed to extract the expected native libraries from the downloaded APK."
+            exit 1
+          fi
+          mv /tmp/nativelibs/lib/arm64-v8a/*.so "${NATIVE_LIBS_DIR}/"
+          failed=0
+          for lib in libfreetype6.so liblua51.so libsoft_oal.so; do
+            path="${NATIVE_LIBS_DIR}/${lib}"
+            if [ ! -s "${path}" ] || ! file "${path}" | grep -q "ELF" || ! file "${path}" | grep -Eq "aarch64|ARM aarch64"; then
+              echo "::error::Native library ${lib} is missing, empty, or not an arm64 ELF object."
+              failed=1
+            fi
+          done
+          if [ "${failed}" -ne 0 ]; then
+            echo "::error::Native library verification failed - aborting before build."
+            exit 1
+          fi
+          ls -la "${NATIVE_LIBS_DIR}/"
+
+      - name: Build APK (Release)
+        run: |
+          set -euo pipefail
+          if ! dotnet publish OpenRA.Android/OpenRA.Android.csproj \
+            -f net9.0-android -c Release \
+            -p:AndroidPackageFormats=apk \
+            -p:ApplicationVersion=1 \
+            -p:ApplicationDisplayVersion=1.0-fixed \
+            --no-self-contained; then
+            echo "::error::dotnet publish failed for OpenRA.Android (Release, net9.0-android). See the compiler output above."
+            exit 1
+          fi
+
+      - name: Locate built APK (deterministic)
+        run: |
+          set -euo pipefail
+          RESOLVED=""
+          for p in \
+            "OpenRA.Android/obj/Release/android/bin/net.openra.android.apk" \
+            "bin/publish/net.openra.android.apk" \
+            "OpenRA.Android/bin/publish/net.openra.android.apk"; do
+            if [ -s "${p}" ]; then
+              RESOLVED="${p}"
+              break
+            fi
+          done
+          if [ -z "${RESOLVED}" ]; then
+            found=()
+            while IFS= read -r -d '' f; do found+=("${f}"); done \
+              < <(find OpenRA.Android -name '*.apk' -type f -size +0c -print0 2>/dev/null)
+            if [ "${#found[@]}" -eq 1 ]; then
+              RESOLVED="${found[0]}"
+            elif [ "${#found[@]}" -eq 0 ]; then
+              echo "::error::Build succeeded but no non-empty APK was produced."
+              exit 1
+            else
+              echo "::error::Ambiguous APK outputs - refusing to pick one at random:"
+              printf '  %s\n' "${found[@]}"
+              exit 1
+            fi
+          fi
+          ls -la "${RESOLVED}"
+          mkdir -p "${RUNNER_TEMP}/signing" "${RUNNER_TEMP}/out"
+          cp "${RESOLVED}" "${RUNNER_TEMP}/signing/unsigned.apk"
+
+      - name: Sign APK with release keystore (zipalign + apksigner)
+        env:
+          TAG: ${{ inputs.tag_name }}
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          if [ -z "${SDK}" ] || [ ! -d "${SDK}/build-tools" ]; then
+            echo "::error::Android SDK build-tools not found on the runner (ANDROID_SDK_ROOT/ANDROID_HOME)."
+            exit 1
+          fi
+          ZIPALIGN="$(ls -1 "${SDK}"/build-tools/*/zipalign 2>/dev/null | sort -V | tail -n 1)"
+          APKSIGNER="$(ls -1 "${SDK}"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -n 1)"
+          if [ -z "${ZIPALIGN}" ] || [ -z "${APKSIGNER}" ]; then
+            echo "::error::zipalign/apksigner not found under ${SDK}/build-tools."
+            exit 1
+          fi
+          echo "Using: ${ZIPALIGN} / ${APKSIGNER}"
+
+          KS="${RUNNER_TEMP}/signing/release.keystore"
+          umask 077
+          if ! printf '%s' "${ANDROID_KEYSTORE_BASE64}" | base64 --decode > "${KS}"; then
+            echo "::error::Failed to decode ANDROID_KEYSTORE_BASE64 into a keystore file."
+            exit 1
+          fi
+          if [ ! -s "${KS}" ]; then
+            echo "::error::Decoded keystore is empty - check ANDROID_KEYSTORE_BASE64."
+            exit 1
+          fi
+
+          # Secret values are masked in GitHub Actions logs by the platform.
+          if ! "${ZIPALIGN}" -f -p 4 "${RUNNER_TEMP}/signing/unsigned.apk" "${RUNNER_TEMP}/signing/aligned.apk"; then
+            echo "::error::zipalign failed."
+            exit 1
+          fi
+          FINAL_APK="${RUNNER_TEMP}/out/OpenRA-Android-arm64-v8a-${TAG}.apk"
+          if ! "${APKSIGNER}" sign \
+            --ks "${KS}" \
+            --ks-key-alias "${ANDROID_KEY_ALIAS}" \
+            --ks-pass "pass:${ANDROID_KEYSTORE_PASSWORD}" \
+            --key-pass "pass:${ANDROID_KEY_PASSWORD}" \
+            --out "${FINAL_APK}" \
+            "${RUNNER_TEMP}/signing/aligned.apk"; then
+            echo "::error::apksigner failed to sign the APK. Check ANDROID_KEYSTORE_PASSWORD / ANDROID_KEY_ALIAS / ANDROID_KEY_PASSWORD."
+            exit 1
+          fi
+          if [ ! -s "${FINAL_APK}" ]; then
+            echo "::error::Signed APK is missing or empty."
+            exit 1
+          fi
+          echo "APK_PATH=${FINAL_APK}" >> "${GITHUB_ENV}"
+          echo "APK_NAME=$(basename "${FINAL_APK}")" >> "${GITHUB_ENV}"
+
+      - name: Verify signature and architecture of signed APK
+        id: verify
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          APKSIGNER="$(ls -1 "${SDK}"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -n 1)"
+          if ! "${APKSIGNER}" verify --verbose --print-certs "${APK_PATH}"; then
+            echo "::error::apksigner verify FAILED - the APK signature is invalid. Release will not be published."
+            exit 1
+          fi
+
+          ABIS="$(unzip -Z1 "${APK_PATH}" | grep '^lib/' | cut -d/ -f2 | sort -u || true)"
+          if [ -z "${ABIS}" ]; then
+            echo "::error::Signed APK contains no lib/<abi>/ directories."
+            exit 1
+          fi
+          echo "ABIs inside signed APK:"; echo "${ABIS}"
+          if ! printf '%s\n' "${ABIS}" | grep -qx "arm64-v8a"; then
+            echo "::error::Signed APK does not contain arm64-v8a, the only ABI supported by this project."
+            exit 1
+          fi
+          {
+            echo "abis<<ABIS_EOF"
+            echo "${ABIS}"
+            echo "ABIS_EOF"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Upload signed APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-apk
+          path: ${{ env.APK_PATH }}
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Clean up temporary signing files
+        if: always()
+        run: |
+          shred -u "${RUNNER_TEMP}/signing/release.keystore" 2>/dev/null || rm -f "${RUNNER_TEMP}/signing/release.keystore"
+          rm -rf "${RUNNER_TEMP}/signing"
+          echo "Temporary keystore and intermediate files removed."
+
+    outputs:
+      commit: ${{ steps.src.outputs.commit }}
+      abis: ${{ steps.verify.outputs.abis }}
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download signed APK
+        uses: actions/download-artifact@v4
+        with:
+          name: signed-apk
+          path: release-assets
+
+      - name: Re-verify signature and prepare release assets
+        env:
+          TAG: ${{ inputs.tag_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          APK="release-assets/OpenRA-Android-arm64-v8a-${TAG}.apk"
+          if [ ! -s "${APK}" ]; then
+            echo "::error::Signed APK artifact is missing or empty: ${APK}. Release will not be created."
+            exit 1
+          fi
+
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          APKSIGNER="$(ls -1 "${SDK}"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -n 1)"
+          if [ -z "${APKSIGNER}" ] || ! "${APKSIGNER}" verify "${APK}"; then
+            echo "::error::Signature re-verification failed in the publish job. Release will not be created."
+            exit 1
+          fi
+
+          set +e
+          err="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" 2>&1)"
+          rc=$?
+          set -e
+          if [ "${rc}" -eq 0 ]; then
+            echo "::error::A release for '${TAG}' appeared while building. Refusing to replace it or its assets."
+            exit 1
+          fi
+          if ! printf '%s' "${err}" | grep -q "HTTP 404"; then
+            echo "::error::Could not check existing releases (gh api rc=${rc}): ${err}"
+            exit 1
+          fi
+
+          cd release-assets
+          sha256sum "$(basename "${APK}")" > "$(basename "${APK}").sha256"
+          cat "$(basename "${APK}").sha256"
+
+      - name: Create GitHub Release and upload assets
+        env:
+          TAG: ${{ inputs.tag_name }}
+          RELEASE_NAME: ${{ inputs.release_name }}
+          PRERELEASE: ${{ inputs.prerelease }}
+          BRANCH: ${{ inputs.source_branch }}
+          COMMIT: ${{ needs.build.outputs.commit }}
+          ABIS: ${{ needs.build.outputs.abis }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd release-assets
+          TITLE="${RELEASE_NAME:-${TAG}}"
+          NOTES="$(mktemp)"
+          cat > "${NOTES}" <<EOF
+          ## OpenRA Android ${TITLE}
+
+          - **Version / tag:** ${TAG}
+          - **Built from:** branch \`${BRANCH}\` (commit \`${COMMIT}\`)
+          - **APK architecture:** arm64-v8a (native libs: libfreetype6, liblua51, libsoft_oal)
+          - **ABIs inside APK:**
+          \`\`\`
+          ${ABIS}
+          \`\`\`
+          - **Signing:** signed with the repository release keystore (zipalign + apksigner); signature verified with \`apksigner verify\` during CI.
+
+          **Verify your download:**
+          \`\`\`
+          sha256sum -c OpenRA-Android-arm64-v8a-${TAG}.apk.sha256
+          \`\`\`
+          EOF
+
+          args=(release create "${TAG}"
+            --target "${COMMIT}"
+            --title "${TITLE}"
+            --notes-file "${NOTES}"
+            "OpenRA-Android-arm64-v8a-${TAG}.apk"
+            "OpenRA-Android-arm64-v8a-${TAG}.apk.sha256")
+          if [ "${PRERELEASE}" = "true" ]; then
+            args+=(--prerelease)
+          fi
+
+          if ! gh "${args[@]}"; then
+            echo "::error::gh release create failed for '${TAG}'. Check the output above; nothing was deleted or replaced."
+            rm -f "${NOTES}"
+            exit 1
+          fi
+          rm -f "${NOTES}"
+          echo "Release published: https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
