@@ -13,9 +13,9 @@ on:
   workflow_dispatch:
     inputs:
       branch:
-        description: 'Branch to build'
-        required: true
-        default: 'Main'
+        description: 'Branch to build (leave empty to use the branch selected below when starting the workflow)'
+        required: false
+        default: ''
         type: string
 
 permissions:
@@ -30,21 +30,27 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Validate branch input
+      - name: Resolve branch to build
+        id: resolve
         env:
-          BRANCH: ${{ inputs.branch }}
+          BRANCH_INPUT: ${{ inputs.branch }}
         run: |
           set -euo pipefail
+          # Fall back to the ref the workflow was started from (the branch chosen in
+          # the Actions UI). An explicit input always wins; this avoids accidentally
+          # rebuilding Main when the field was left at its old 'Main' default.
+          BRANCH="${BRANCH_INPUT:-${GITHUB_REF_NAME}}"
           if [ -z "${BRANCH}" ]; then
-            echo "::error::Branch input is empty. Choose a branch to build (default: Main)."
+            echo "::error::No branch given and the workflow was not started from a branch."
             exit 1
           fi
           echo "Building branch: ${BRANCH}"
+          echo "branch=${BRANCH}" >> "${GITHUB_OUTPUT}"
 
       - name: Clone Repository
         uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.branch }}
+          ref: ${{ steps.resolve.outputs.branch }}
 
       - name: Install .NET 9.0
         uses: actions/setup-dotnet@v5
