@@ -1,0 +1,11 @@
+barracks.infiltrated:
+	ProvidesPrerequisite:
+
+warfactory.infiltrated:
+	ProvidesPrerequisite:
+
+allies.tech.infiltrated:
+	ProvidesPrerequisite:
+
+soviets.tech.infiltrated:
+	ProvidesPrerequisite:

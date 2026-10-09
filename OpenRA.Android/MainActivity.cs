@@ -10,7 +10,9 @@
 #endregion
 
 using System;
+using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Threading;
 using Android.App;
 using Android.Content.PM;
@@ -36,6 +38,11 @@ namespace OpenRA.Android
 	public class MainActivity : Activity
 	{
 		const string Tag = "OpenRA";
+
+		// Bump when the bundled asset set changes (e.g. the RA2 mod was added) so existing
+		// installs re-extract the engine assets on the next launch.
+		const string AssetsVersion = "2-ra2";
+
 		OpenRASurfaceView surfaceView;
 		AndroidPlatformWindow window;
 
@@ -76,11 +83,52 @@ namespace OpenRA.Android
 				return;
 			engineStarted = true;
 
+			// Minimal mod selection: the engine itself has no mod chooser, so let the player
+			// pick between the bundled mods (e.g. Red Alert or the integrated RA2 mod) before
+			// the engine thread starts. The choice is remembered for the next launch.
+			var mods = DiscoverLaunchableMods();
+			if (mods.Count == 0)
+			{
+				global::Android.Util.Log.Error(Tag, "No launchable mods found in the extracted engine assets; falling back to ra.");
+				StartEngine("ra");
+				return;
+			}
+
+			RunOnUiThread(() =>
+			{
+				var names = mods.Select(m => m.DisplayName).ToArray();
+				var lastMod = LoadLastMod();
+				var checkedIndex = mods.FindIndex(m => string.Equals(m.Id, lastMod, StringComparison.Ordinal));
+				if (checkedIndex < 0)
+					checkedIndex = mods.FindIndex(m => m.Id == "ra");
+				if (checkedIndex < 0)
+					checkedIndex = 0;
+
+				var builder = new AlertDialog.Builder(this);
+				builder.SetTitle("Select mod");
+				builder.SetSingleChoiceItems(names, checkedIndex, (dialog, which) => { });
+				builder.SetPositiveButton("Launch", (dialog, which) =>
+				{
+					var alertDialog = dialog as AlertDialog;
+					var position = alertDialog?.ListView?.CheckedItemPosition ?? checkedIndex;
+					if (position < 0 || position >= mods.Count)
+						position = checkedIndex;
+
+					SaveLastMod(mods[position].Id);
+					StartEngine(mods[position].Id);
+				});
+				builder.SetCancelable(false);
+				builder.Show();
+			});
+		}
+
+		void StartEngine(string modId)
+		{
 			var args = new[]
 			{
 				$"Engine.EngineDir={engineDir}",
 				$"Engine.SupportDir={supportDir}",
-				"Game.Mod=ra"
+				$"Game.Mod={modId}"
 			};
 
 			new Thread(() =>
@@ -98,13 +146,125 @@ namespace OpenRA.Android
 			{ Name = "OpenRA Main", IsBackground = false }.Start();
 		}
 
+		readonly struct LaunchableMod
+		{
+			public readonly string Id;
+			public readonly string DisplayName;
+
+			public LaunchableMod(string id, string displayName)
+			{
+				Id = id;
+				DisplayName = displayName;
+			}
+		}
+
+		// List the playable mods bundled in the extracted engine assets. "all" and the
+		// "*-content" installer mods are infrastructure and are not offered.
+		List<LaunchableMod> DiscoverLaunchableMods()
+		{
+			var result = new List<LaunchableMod>();
+			var modsRoot = Path.Combine(engineDir, "mods");
+			if (!Directory.Exists(modsRoot))
+				return result;
+
+			foreach (var dir in Directory.GetDirectories(modsRoot).OrderBy(d => d, StringComparer.Ordinal))
+			{
+				var id = Path.GetFileName(dir);
+				if (id == "all" || id.EndsWith("-content", StringComparison.Ordinal))
+					continue;
+
+				var manifest = Path.Combine(dir, "mod.yaml");
+				if (!File.Exists(manifest))
+					continue;
+
+				result.Add(new LaunchableMod(id, ReadModTitle(manifest, dir, id)));
+			}
+
+			return result;
+		}
+
+		static string ReadModTitle(string manifestPath, string modDir, string fallback)
+		{
+			try
+			{
+				string title = null;
+				foreach (var line in File.ReadLines(manifestPath))
+				{
+					if (line.StartsWith("\tTitle: ", StringComparison.Ordinal))
+					{
+						title = line.Substring(8).Trim();
+						break;
+					}
+				}
+
+				if (string.IsNullOrEmpty(title))
+					return fallback;
+
+				// Modern engine mods reference their display name through the fluent catalog.
+				if (title != "mod-title")
+					return title;
+
+				var fluentDir = Path.Combine(modDir, "fluent");
+				if (Directory.Exists(fluentDir))
+				{
+					foreach (var ftl in Directory.GetFiles(fluentDir, "*.ftl"))
+					{
+						foreach (var line in File.ReadLines(ftl))
+						{
+							if (line.StartsWith("mod-title = ", StringComparison.Ordinal))
+								return line.Substring(12).Trim();
+						}
+					}
+				}
+
+				return fallback;
+			}
+			catch (Exception e)
+			{
+				global::Android.Util.Log.Warn(Tag, $"Failed to read mod title from {manifestPath}: {e.Message}");
+				return fallback;
+			}
+		}
+
+		string LastModFilePath => Path.Combine(supportDir, "last-mod.txt");
+
+		string LoadLastMod()
+		{
+			try
+			{
+				return File.Exists(LastModFilePath) ? File.ReadAllText(LastModFilePath).Trim() : "ra";
+			}
+			catch
+			{
+				return "ra";
+			}
+		}
+
+		void SaveLastMod(string modId)
+		{
+			try { File.WriteAllText(LastModFilePath, modId); }
+			catch { /* non-fatal: the chooser will just default next time */ }
+		}
+
 		string ExtractAssets()
 		{
 			var dest = Path.Combine(FilesDir.AbsolutePath, "engine") + Path.DirectorySeparatorChar;
 			var marker = Path.Combine(dest, ".extracted");
 
-			if (File.Exists(marker))
+			// Re-extract when the marker is missing or was written for a different asset set
+			// (e.g. before the RA2 mod was added), so existing installs pick up new mods.
+			if (File.Exists(marker) && File.ReadAllText(marker).Trim() == AssetsVersion)
 				return dest;
+
+			try
+			{
+				if (Directory.Exists(dest))
+					Directory.Delete(dest, true);
+			}
+			catch (Exception e)
+			{
+				global::Android.Util.Log.Warn(Tag, $"Could not clear old engine assets: {e.Message}");
+			}
 
 			Directory.CreateDirectory(dest);
 			CopyAssetDir("glsl", Path.Combine(dest, "glsl"));
@@ -112,12 +272,12 @@ namespace OpenRA.Android
 			CopyAssetFile("VERSION", Path.Combine(dest, "VERSION"));
 			CopyAssetFile("global mix database.dat", Path.Combine(dest, "global mix database.dat"));
 
-			// The map directories are excluded from the APK assets (maps are large and not needed
-			// for the menu), but MapCache.LoadMaps expects each mod's maps/ folder to exist.
-			foreach (var mod in new[] { "ra", "cnc", "d2k", "ts", "all", "common" })
+			// MapCache.LoadMaps expects each mod's maps/ folder to exist, even for mods whose
+			// maps are bundled with the APK assets (ra2 ships its maps including the shellmap).
+			foreach (var mod in new[] { "ra", "cnc", "d2k", "ts", "all", "common", "ra2" })
 				Directory.CreateDirectory(Path.Combine(dest, "mods", mod, "maps"));
 
-			File.WriteAllText(marker, DateTime.UtcNow.ToString("o"));
+			File.WriteAllText(marker, AssetsVersion);
 			global::Android.Util.Log.Info(Tag, $"Extracted engine assets to {dest}");
 			return dest;
 		}

@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 	<PropertyGroup>
 		<TargetFramework>net9.0-android</TargetFramework>
 		<SupportedOSPlatformVersion>24</SupportedOSPlatformVersion>
@@ -20,6 +20,8 @@
 		<ProjectReference Include="..\OpenRA.Mods.Common\OpenRA.Mods.Common.csproj" />
 		<ProjectReference Include="..\OpenRA.Mods.Cnc\OpenRA.Mods.Cnc.csproj" />
 		<ProjectReference Include="..\OpenRA.Mods.D2k\OpenRA.Mods.D2k.csproj" />
+		<!-- RA2 mod assembly: loaded by the engine via mods/ra2/mod.yaml Assemblies. -->
+		<ProjectReference Include="..\OpenRA.Mods.RA2\OpenRA.Mods.RA2.csproj" />
 	</ItemGroup>
 
 	<!-- Engine assets shipped inside the APK. The Activity extracts these to internal storage on
@@ -47,6 +49,10 @@
 		<AndroidAsset Include="..\mods\cnc-content\**\*.*" Link="assets\mods\cnc-content\%(RecursiveDir)%(Filename)%(Extension)" />
 		<AndroidAsset Include="..\mods\d2k-content\**\*.*" Link="assets\mods\d2k-content\%(RecursiveDir)%(Filename)%(Extension)" />
 		<AndroidAsset Include="..\mods\ts-content\**\*.*" Link="assets\mods\ts-content\%(RecursiveDir)%(Filename)%(Extension)" />
+		<!-- RA2 mod (Red Alert 2). Requires the user to supply legally-owned RA2 game data
+		     in ^SupportDir/Content/ra2 (see ANDROID.md); the mod definition, chrome and
+		     maps (incl. the shellmap) ship with the app, mirroring how mods/ra is bundled. -->
+		<AndroidAsset Include="..\mods\ra2\**\*.*" Link="assets\mods\ra2\%(RecursiveDir)%(Filename)%(Extension)" />
 	</ItemGroup>
 
 	<!-- Native libraries built from source with the NDK (thirdparty/build-*-android.sh). These must

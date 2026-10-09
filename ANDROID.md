@@ -101,6 +101,38 @@ Changes to the core engine are minimal and guarded by `OperatingSystem.IsAndroid
 
 Desktop builds are completely unaffected.
 
+## Red Alert 2 (RA2) mod
+
+This port bundles the [OpenRA2](https://github.com/hel1o-wor1d/OpenRA2) mod (GPLv3):
+
+- `OpenRA.Mods.RA2/` - the mod's C# assembly, adapted to this engine's API
+  (docking notifications, `[VerifySync]`, sequence loader hooks, ...).
+- `mods/ra2/` - mod rules, sequences, weapons, chrome, tilesets and maps,
+  migrated from engine `release-20230225` with the engine's official
+  `--update-mod release-20230225` rules plus a few documented manual fixes.
+- The launch screen now offers a mod chooser (Red Alert, Tiberian Dawn, ...
+  and Red Alert 2); the last choice is remembered.
+
+### RA2 game data (required, not included)
+
+Red Alert 2 artwork/audio is copyrighted and is **not** redistributed with the
+app. Copy the mix files from your own legally obtained copy of the game to the
+app's support directory before launching the RA2 mod:
+
+```
+Android/data/net.openra.android/files/Support/Content/ra2/
+```
+
+Required files (from `mods/ra2/mod.yaml`): `ra2.mix`, `language.mix`,
+`multi.mix`, `audio.mix`, `cache.mix`, `cameo.mix`, `conquer.mix`,
+`generic.mix`, `isogen.mix`, `isosnow.mix`, `isotemp.mix`, `isourb.mix`,
+`load.mix`, `local.mix`, `neutral.mix`, `sidec01.mix`, `sidec02.mix`,
+`sno.mix`, `snow.mix`, `tem.mix`, `temperat.mix`, `theme.mix`, `urb.mix`,
+`urban.mix`, `audio.bag`.
+
+Without this data the RA2 mod starts but can not enter a game; the bundled
+maps and mod definitions are still included so the menu works.
+
 ## GitHub Actions setup (CI & signed releases)
 
 All Android workflows are **manual-only** (`workflow_dispatch`) — nothing runs on
