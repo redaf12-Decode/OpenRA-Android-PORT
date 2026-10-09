@@ -1,0 +1,447 @@
+
+name: Android Release (Test)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Release tag, e.g. v1.0.0"
+        required: true
+        type: string
+      release_name:
+        description: "Release title (defaults to tag name)"
+        required: false
+        default: ""
+        type: string
+      prerelease:
+        description: "Mark this release as a pre-release"
+        required: true
+        default: false
+        type: boolean
+      source_branch:
+        description: "Branch to build from"
+        required: true
+        default: "Main"
+        type: string
+      signing_mode:
+        description: "temporary = test key; repository = persistent release key"
+        required: true
+        default: temporary
+        type: choice
+        options:
+          - temporary
+          - repository
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-release-${{ inputs.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build and sign Android APK
+    runs-on: ubuntu-latest
+
+    outputs:
+      commit: ${{ steps.source.outputs.commit }}
+      signing_mode: ${{ steps.sign.outputs.signing_mode }}
+
+    steps:
+      - name: Validate inputs
+        env:
+          TAG: ${{ inputs.tag_name }}
+          BRANCH: ${{ inputs.source_branch }}
+          MODE: ${{ inputs.signing_mode }}
+        run: |
+          set -euo pipefail
+
+          if ! [[ "$TAG" =~ ^[0-9A-Za-z][0-9A-Za-z._-]*$ ]]; then
+            echo "::error::Invalid tag_name."
+            exit 1
+          fi
+
+          if [ -z "$BRANCH" ]; then
+            echo "::error::source_branch cannot be empty."
+            exit 1
+          fi
+
+          if [[ "$BRANCH" == -* ]]; then
+            echo "::error::Invalid source branch."
+            exit 1
+          fi
+
+          if [[ "$MODE" != "temporary" && "$MODE" != "repository" ]]; then
+            echo "::error::Invalid signing mode."
+            exit 1
+          fi
+
+      - name: Check repository signing secrets
+        if: inputs.signing_mode == 'repository'
+        env:
+          KS_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KS_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          [ -n "$KS_BASE64" ] || { echo "::error::Missing ANDROID_KEYSTORE_BASE64"; exit 1; }
+          [ -n "$KS_PASSWORD" ] || { echo "::error::Missing ANDROID_KEYSTORE_PASSWORD"; exit 1; }
+          [ -n "$KEY_ALIAS" ] || { echo "::error::Missing ANDROID_KEY_ALIAS"; exit 1; }
+          [ -n "$KEY_PASSWORD" ] || { echo "::error::Missing ANDROID_KEY_PASSWORD"; exit 1; }
+
+          echo "Repository signing secrets are configured."
+
+      - name: Checkout source branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_branch }}
+          fetch-depth: 1
+
+      - name: Record source commit
+        id: source
+        run: |
+          set -euo pipefail
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "Source commit: $(git rev-parse HEAD)"
+
+      - name: Check tag and release do not already exist
+        env:
+          TAG: ${{ inputs.tag_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          if git ls-remote --exit-code --tags origin \
+            "refs/tags/${TAG}" "refs/tags/${TAG}^{}" >/dev/null 2>&1; then
+            echo "::error::Tag already exists. Choose a new tag."
+            exit 1
+          else
+            rc=$?
+            if [ "$rc" -ne 2 ]; then
+              echo "::error::Could not verify remote tags."
+              exit 1
+            fi
+          fi
+
+          set +e
+          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" \
+            >/dev/null 2>&1
+          rc=$?
+          set -e
+
+          if [ "$rc" -eq 0 ]; then
+            echo "::error::A release with this tag already exists."
+            exit 1
+          fi
+
+          # Confirm that the failure was a 404, not an API or permission error.
+          set +e
+          STATUS=$(gh api \
+            "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" \
+            --include 2>/dev/null | head -n 1)
+          set -e
+
+          if [[ "$STATUS" != *"404"* ]]; then
+            echo "::error::Could not safely confirm that the release is absent."
+            exit 1
+          fi
+
+          echo "No existing release found."
+
+      - name: Install .NET 9
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "9.0.x"
+
+      - name: Install JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Android workload
+        run: |
+          set -euo pipefail
+          dotnet workload install android
+
+      - name: Download native libraries
+        run: |
+          set -euo pipefail
+
+          LIB_DIR="OpenRA.Android/jniLibs/arm64-v8a"
+          mkdir -p "$LIB_DIR" /tmp/nativelibs
+
+          wget -q \
+            "https://github.com/tarek369/OpenRA/releases/download/v1.0-android/OpenRA-Android-arm64.apk" \
+            -O /tmp/native-libraries.apk
+
+          unzip -o /tmp/native-libraries.apk \
+            "lib/arm64-v8a/libfreetype6.so" \
+            "lib/arm64-v8a/liblua51.so" \
+            "lib/arm64-v8a/libsoft_oal.so" \
+            -d /tmp/nativelibs
+
+          for lib in libfreetype6.so liblua51.so libsoft_oal.so; do
+            src="/tmp/nativelibs/lib/arm64-v8a/$lib"
+
+            if [ ! -s "$src" ]; then
+              echo "::error::Missing native library: $lib"
+              exit 1
+            fi
+
+            file "$src" | grep -q ELF || {
+              echo "::error::Invalid native library: $lib"
+              exit 1
+            }
+
+            cp "$src" "$LIB_DIR/"
+          done
+
+          ls -lh "$LIB_DIR"
+
+      - name: Build Release APK
+        run: |
+          set -euo pipefail
+
+          dotnet publish OpenRA.Android/OpenRA.Android.csproj \
+            -f net9.0-android \
+            -c Release \
+            -p:AndroidPackageFormats=apk \
+            -p:ApplicationVersion=1 \
+            -p:ApplicationDisplayVersion=1.0-fixed \
+            --no-self-contained
+
+      - name: Locate APK
+        run: |
+          set -euo pipefail
+
+          candidates=()
+
+          while IFS= read -r -d '' apk; do
+            candidates+=("$apk")
+          done < <(
+            find OpenRA.Android -type f -name '*.apk' -size +0c -print0
+          )
+
+          if [ "${#candidates[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one APK; found ${#candidates[@]}."
+            printf '%s\n' "${candidates[@]}"
+            exit 1
+          fi
+
+          mkdir -p "$RUNNER_TEMP/signing" "$RUNNER_TEMP/out"
+          cp "${candidates[0]}" "$RUNNER_TEMP/signing/unsigned.apk"
+
+          echo "Found APK: ${candidates[0]}"
+
+      - name: Sign APK
+        id: sign
+        env:
+          MODE: ${{ inputs.signing_mode }}
+          TAG: ${{ inputs.tag_name }}
+          KS_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KS_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          umask 077
+
+          cleanup() {
+            rm -rf "$RUNNER_TEMP/signing"
+          }
+          trap cleanup EXIT
+
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          [ -n "$SDK" ] || {
+            echo "::error::Android SDK path is missing."
+            exit 1
+          }
+
+          ZIPALIGN=$(find "$SDK/build-tools" -type f -name zipalign \
+            | sort -V | tail -n 1)
+          APKSIGNER=$(find "$SDK/build-tools" -type f -name apksigner \
+            | sort -V | tail -n 1)
+
+          [ -x "$ZIPALIGN" ] && [ -x "$APKSIGNER" ] || {
+            echo "::error::zipalign or apksigner was not found."
+            exit 1
+          }
+
+          KS="$RUNNER_TEMP/signing/release.keystore"
+          STORE_PASS_FILE="$RUNNER_TEMP/signing/store-password.txt"
+          KEY_PASS_FILE="$RUNNER_TEMP/signing/key-password.txt"
+          ALIAS=""
+
+          if [ "$MODE" = "temporary" ]; then
+            STORE_PASS=$(openssl rand -hex 32)
+            KEY_PASS="$STORE_PASS"
+            ALIAS="openra-test-${GITHUB_RUN_ID}"
+
+            printf '%s' "$STORE_PASS" > "$STORE_PASS_FILE"
+            printf '%s' "$KEY_PASS" > "$KEY_PASS_FILE"
+
+            keytool -genkeypair -noprompt \
+              -keystore "$KS" \
+              -storetype JKS \
+              -storepass "$STORE_PASS" \
+              -keypass "$KEY_PASS" \
+              -alias "$ALIAS" \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 3650 \
+              -dname "CN=OpenRA Temporary Test,O=OpenRA,C=US"
+
+            echo "Generated a disposable test keystore."
+
+          elif [ "$MODE" = "repository" ]; then
+            printf '%s' "$KS_BASE64" | base64 --decode > "$KS"
+            [ -s "$KS" ] || {
+              echo "::error::Decoded keystore is empty."
+              exit 1
+            }
+
+            printf '%s' "$KS_PASSWORD" > "$STORE_PASS_FILE"
+            printf '%s' "$KEY_PASSWORD" > "$KEY_PASS_FILE"
+            ALIAS="$KEY_ALIAS"
+          else
+            echo "::error::Unsupported signing mode."
+            exit 1
+          fi
+
+          chmod 600 "$KS" "$STORE_PASS_FILE" "$KEY_PASS_FILE"
+
+          "$ZIPALIGN" -f -p 4 \
+            "$RUNNER_TEMP/signing/unsigned.apk" \
+            "$RUNNER_TEMP/signing/aligned.apk"
+
+          FINAL_APK="$RUNNER_TEMP/out/OpenRA-Android-arm64-v8a-${TAG}.apk"
+
+          "$APKSIGNER" sign \
+            --ks "$KS" \
+            --ks-key-alias "$ALIAS" \
+            --ks-pass "file:$STORE_PASS_FILE" \
+            --key-pass "file:$KEY_PASS_FILE" \
+            --out "$FINAL_APK" \
+            "$RUNNER_TEMP/signing/aligned.apk"
+
+          "$APKSIGNER" verify --verbose "$FINAL_APK"
+
+          [ -s "$FINAL_APK" ] || {
+            echo "::error::Signed APK is missing."
+            exit 1
+          }
+
+          echo "APK_PATH=$FINAL_APK" >> "$GITHUB_ENV"
+          echo "signing_mode=$MODE" >> "$GITHUB_OUTPUT"
+
+      - name: Verify APK architecture
+        run: |
+          set -euo pipefail
+
+          unzip -Z1 "$APK_PATH" > "$RUNNER_TEMP/apk-files.txt"
+
+          if ! grep -q '^lib/arm64-v8a/' "$RUNNER_TEMP/apk-files.txt"; then
+            echo "::error::APK does not contain arm64-v8a native libraries."
+            exit 1
+          fi
+
+          sha256sum "$APK_PATH"
+
+      - name: Upload signed APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-android-apk
+          path: ${{ env.APK_PATH }}
+          if-no-files-found: error
+          retention-days: 3
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download signed APK
+        uses: actions/download-artifact@v4
+        with:
+          name: signed-android-apk
+          path: release-assets
+
+      - name: Prepare APK and checksum
+        env:
+          TAG: ${{ inputs.tag_name }}
+        run: |
+          set -euo pipefail
+
+          APK="release-assets/OpenRA-Android-arm64-v8a-${TAG}.apk"
+
+          if [ ! -s "$APK" ]; then
+            echo "::error::Signed APK is missing."
+            exit 1
+          fi
+
+          cd release-assets
+          sha256sum "$(basename "$APK")" \
+            > "$(basename "$APK").sha256"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag_name }}
+          TITLE_INPUT: ${{ inputs.release_name }}
+          PRERELEASE: ${{ inputs.prerelease }}
+          BRANCH: ${{ inputs.source_branch }}
+          COMMIT: ${{ needs.build.outputs.commit }}
+          MODE: ${{ needs.build.outputs.signing_mode }}
+        run: |
+          set -euo pipefail
+
+          APK="OpenRA-Android-arm64-v8a-${TAG}.apk"
+          CHECKSUM="${APK}.sha256"
+          TITLE="${TITLE_INPUT:-$TAG}"
+
+          if [ "$MODE" = "temporary" ]; then
+            SIGNING_NOTE="Temporary test key. This key is not retained; future updates signed with a different key may not install over this APK."
+          else
+            SIGNING_NOTE="Signed with the persistent repository release keystore."
+          fi
+
+          cat > "$RUNNER_TEMP/release-notes.md" <<EOF
+          ## OpenRA Android ${TITLE}
+
+          - Version: ${TAG}
+          - Source branch: ${BRANCH}
+          - Source commit: ${COMMIT}
+          - Architecture: arm64-v8a
+          - Signing mode: ${MODE}
+          - Signing: ${SIGNING_NOTE}
+
+          Verify the download checksum:
+
+          \`\`\`bash
+          sha256sum -c ${CHECKSUM}
+          \`\`\`
+          EOF
+
+          args=(
+            release create "$TAG"
+            --target "$COMMIT"
+            --title "$TITLE"
+            --notes-file "$RUNNER_TEMP/release-notes.md"
+            "$APK"
+            "$CHECKSUM"
+          )
+
+          if [ "$PRERELEASE" = "true" ]; then
+            args+=(--prerelease)
+          fi
+
+          gh "${args[@]}"
+
+          echo "Published: https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
