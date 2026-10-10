@@ -110,6 +110,10 @@ This port bundles the [OpenRA2](https://github.com/hel1o-wor1d/OpenRA2) mod (GPL
 - `mods/ra2/` - mod rules, sequences, weapons, chrome, tilesets and maps,
   migrated from engine `release-20230225` with the engine's official
   `--update-mod release-20230225` rules plus a few documented manual fixes.
+- `mods/Ra2-content/` - the RA2 *content installer* mod (same role as
+  `mods/ra-content`). It also vendors the unmodified `mods/ra2/` tree from the
+  OpenRA2 repository for reference; only its `mod.yaml` and `fluent/` are
+  referenced at runtime and bundled into the APK.
 - The launch screen now offers a mod chooser (Red Alert, Tiberian Dawn, ...
   and Red Alert 2); the last choice is remembered.
 
@@ -128,10 +132,21 @@ Required files (from `mods/ra2/mod.yaml`): `ra2.mix`, `language.mix`,
 `generic.mix`, `isogen.mix`, `isosnow.mix`, `isotemp.mix`, `isourb.mix`,
 `load.mix`, `local.mix`, `neutral.mix`, `sidec01.mix`, `sidec02.mix`,
 `sno.mix`, `snow.mix`, `tem.mix`, `temperat.mix`, `theme.mix`, `urb.mix`,
-`urban.mix`, `audio.bag`.
+`urban.mix`, `audio.bag` (plus `audio.idx`, which the `.bag` reader needs).
 
-Without this data the RA2 mod starts but can not enter a game; the bundled
-maps and mod definitions are still included so the menu works.
+### Behaviour without the game data
+
+`mods/ra2/mod.yaml` uses `ContentInstallerFileSystem`. When any of the required
+packages is missing the engine does **not** try to load the mod: it switches to
+the `Ra2-content` installer mod and shows the *Install Content* screen, which
+lists the packages above and lets the player go back or quit. This is what stops
+the previous `OpenRA crashed: File not found: mouse.shp` abort — `mouse.shp` lives
+in `conquer.mix`, so it can only exist once the game data is installed.
+
+Copy the files (the whole directory, `.mix` files keep their nested layout),
+relaunch the RA2 mod, and the mod loads normally. Nothing RA2-specific is
+downloadable: unlike Red Alert / Tiberian Dawn / Dune 2000 the RA2 data is not
+freeware, so there is no quick-install mirror.
 
 ## GitHub Actions setup (CI & signed releases)
 

@@ -53,6 +53,11 @@
 		     in ^SupportDir/Content/ra2 (see ANDROID.md); the mod definition, chrome and
 		     maps (incl. the shellmap) ship with the app, mirroring how mods/ra is bundled. -->
 		<AndroidAsset Include="..\mods\ra2\**\*.*" Link="assets\mods\ra2\%(RecursiveDir)%(Filename)%(Extension)" />
+		<!-- RA2 content installer screen. Shown instead of crashing when Support/Content/ra2 is
+		     empty (the RA2 game data itself is copyrighted and must be supplied by the user).
+		     Only the manifest and its fluent catalog are referenced at runtime. -->
+		<AndroidAsset Include="..\mods\Ra2-content\mod.yaml" Link="assets\mods\Ra2-content\mod.yaml" />
+		<AndroidAsset Include="..\mods\Ra2-content\fluent\**\*.*" Link="assets\mods\Ra2-content\fluent\%(RecursiveDir)%(Filename)%(Extension)" />
 	</ItemGroup>
 
 	<!-- Native libraries built from source with the NDK (thirdparty/build-*-android.sh). These must

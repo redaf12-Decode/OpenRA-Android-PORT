@@ -1,0 +1,91 @@
+# Ra2-content: the Red Alert 2 *content installer* mod.
+#
+# This follows the same layout as mods/ra-content, mods/cnc-content, mods/d2k-content and
+# mods/ts-content: it is not a playable mod (the Android launcher skips any id ending in
+# "-content"), it is the screen the engine switches to when mods/ra2 is started without the
+# copyrighted RA2 game data being installed. Without it the RA2 mod used to die with
+# `OpenRA crashed: File not found: mouse.shp` on the first frame of the main menu.
+#
+# The rules/sequences/maps/... tree from https://github.com/hel1o-wor1d/OpenRA2 is vendored in
+# this directory alongside this manifest; it is not referenced by it (mods/ra2 already ships that
+# content) and is therefore not bundled into the APK - only this manifest and the fluent catalog
+# are. See the "Red Alert 2 (RA2) mod" section in ANDROID.md.
+Metadata:
+	Title: mod-title
+	Version: {DEV_VERSION}
+	Hidden: true
+
+FileSystem: DefaultFileSystem
+	Packages:
+		^EngineDir
+		^EngineDir|mods/common-content: content
+		^EngineDir|mods/common: common
+		$Ra2-content: ra2content
+
+Rules:
+
+Cursors:
+	content|cursors.yaml
+
+Chrome:
+	content|chrome.yaml
+
+Assemblies: OpenRA.Mods.Common.dll, OpenRA.Mods.Cnc.dll
+
+ChromeLayout:
+	content|content.yaml
+
+Notifications:
+	content|notifications.yaml
+
+LoadScreen: ModContentLoadScreen
+	Image: ^EngineDir|mods/common-content/chrome.png
+	Image2x: ^EngineDir|mods/common-content/chrome-2x.png
+	Image3x: ^EngineDir|mods/common-content/chrome-3x.png
+
+ChromeMetrics:
+	common|metrics.yaml
+	content|metrics.yaml
+
+FluentMessages:
+	common|fluent/common.ftl
+	content|fluent/content.ftl
+	content|fluent/chrome.ftl
+	ra2content|fluent/chrome.ftl
+
+Fonts:
+	Tiny:
+		Font: common|FreeSans.ttf
+		Size: 10
+		Ascender: 8
+	TinyBold:
+		Font: common|FreeSansBold.ttf
+		Size: 10
+		Ascender: 8
+	Regular:
+		Font: common|FreeSans.ttf
+		Size: 14
+		Ascender: 11
+	Bold:
+		Font: common|FreeSansBold.ttf
+		Size: 14
+		Ascender: 11
+	MediumBold:
+		Font: common|FreeSansBold.ttf
+		Size: 18
+		Ascender: 14
+	BigBold:
+		Font: common|FreeSansBold.ttf
+		Size: 24
+		Ascender: 18
+
+# TestFiles mirrors the non-optional entries of mods/ra2/mod.yaml ContentPackages, so the
+# "installed" state shown here always agrees with the engine's own content check.
+ModContent:
+	Mod: ra2
+	Packages:
+		ContentPackage@ra2base:
+			Title: modcontent-package-ra2base
+			Identifier: ra2base
+			TestFiles: ^SupportDir|Content/ra2/ra2.mix, ^SupportDir|Content/ra2/language.mix, ^SupportDir|Content/ra2/multi.mix, ^SupportDir|Content/ra2/audio.mix, ^SupportDir|Content/ra2/cache.mix, ^SupportDir|Content/ra2/cameo.mix, ^SupportDir|Content/ra2/conquer.mix, ^SupportDir|Content/ra2/generic.mix, ^SupportDir|Content/ra2/isogen.mix, ^SupportDir|Content/ra2/isosnow.mix, ^SupportDir|Content/ra2/isotemp.mix, ^SupportDir|Content/ra2/isourb.mix, ^SupportDir|Content/ra2/load.mix, ^SupportDir|Content/ra2/local.mix, ^SupportDir|Content/ra2/neutral.mix, ^SupportDir|Content/ra2/sidec01.mix, ^SupportDir|Content/ra2/sidec02.mix, ^SupportDir|Content/ra2/sno.mix, ^SupportDir|Content/ra2/snow.mix, ^SupportDir|Content/ra2/tem.mix, ^SupportDir|Content/ra2/temperat.mix, ^SupportDir|Content/ra2/theme.mix, ^SupportDir|Content/ra2/urb.mix, ^SupportDir|Content/ra2/urban.mix
+			Required: true

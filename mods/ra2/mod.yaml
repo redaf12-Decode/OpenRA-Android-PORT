@@ -10,43 +10,54 @@ ModCredits:
 
 PackageFormats: Mix, AudioBag
 
-FileSystem: DefaultFileSystem
-	Packages:
+# The RA2 game data is copyrighted and is not shipped with the app, so the mod must be able to
+# tell "content is missing" apart from "content is broken". ContentInstallerFileSystem mounts the
+# mod-provided packages as usual, but any missing game package routes the player to the
+# Ra2-content installer screen instead of throwing `File not found: ...` on the first asset lookup.
+# The game packages are listed without a `content|` prefix on purpose: some of them are nested
+# inside ra2.mix and must be resolved through the file index rather than a fixed folder path.
+FileSystem: ContentInstallerFileSystem
+	SystemPackages:
 		~^SupportDir|Content/ra2
 		^EngineDir
 		$ra2: ra2
 		^EngineDir|mods/common: common
-		~ra2.mix
-		~language.mix
-		~multi.mix
-		~audio.mix
-		~cache.mix
-		~cameo.mix
-		~conquer.mix: conquer
-		~generic.mix
-		~isogen.mix
-		~isosnow.mix
-		~isotemp.mix
-		~isourb.mix
-		~load.mix
-		~local.mix
-		~neutral.mix
-		~sidec01.mix
-		~sidec02.mix
-		~sno.mix
-		~snow.mix
-		~tem.mix
-		~temperat.mix
-		~theme.mix
-		~urb.mix
-		~urban.mix
+	ContentPackages:
+		ra2.mix
+		language.mix
+		multi.mix
+		audio.mix
+		cache.mix
+		cameo.mix
+		conquer.mix: conquer
+		generic.mix
+		isogen.mix
+		isosnow.mix
+		isotemp.mix
+		isourb.mix
+		load.mix
+		local.mix
+		neutral.mix
+		sidec01.mix
+		sidec02.mix
+		sno.mix
+		snow.mix
+		tem.mix
+		temperat.mix
+		theme.mix
+		urb.mix
+		urban.mix
+		# Optional: audio.bag needs its audio.idx companion, so a missing/invalid pair must not
+		# block the game (the original package list also mounted it as optional).
 		~audio.bag
+		# Mod-provided packages, mounted after the content packages so they take priority.
 		ra2|bits
 		ra2|bits/cameos
 		ra2|bits/structures
 		ra2|bits/animations
 		ra2|bits/projectiles
 		ra2|uibits
+	ContentInstallerMod: Ra2-content
 
 MapFolders:
 	ra2|maps: System
