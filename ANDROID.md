@@ -81,14 +81,38 @@ adb shell am start -n net.openra.android/$(adb shell dumpsys package net.openra.
 
 ## Touch controls
 
+*A finger is not a mouse.* There is no second button to split "select" from "order", so the
+Android port is mapped onto the engine's **Classic** mouse layout (`Settings.MouseControlStyle`,
+plus `MouseScroll: Standard` so a drag carries the map along with the finger). The gesture is
+resolved first and only then turned into button events, which is what lets a single finger do both
+"select" and "order".
+
 | Gesture | Action |
 |---|---|
-| Tap | Left click |
-| Double-tap | Double-click |
-| Long-press (>500ms) | Right-click |
-| Drag | Move / scroll map / drag-select |
-| Two-finger drag | Pan map |
+| Tap on the map | Select what is under your finger — or give the order that point implies (move, attack, enter, repair, ...) |
+| Double-tap | Select every unit of that type on screen |
+| Press and hold, then drag | Selection box (also drags UI widgets: sliders, scroll bars, minimap) |
+| Drag | Pan the camera (direct, no mouse) |
+| Two-finger drag | Pan the camera |
 | Pinch | Zoom in/out |
+
+How the gestures are resolved (`OpenRA.Platforms.Android/AndroidInput.cs`):
+
+- **Tap** → a left press + release at the same spot. In the Classic layout `WorldInteractionControllerWidget`
+  turns that into "issue the order this point implies" when one applies, otherwise "select what is
+  under the finger".
+- **Double-tap** → the same left press + release with `MultiTapCount = 2` (250 ms / 4 px window),
+  which the engine treats as "select all of that selection class on screen".
+- **Press and hold** (400 ms, finger inside the 16 px slop) → the left button goes down, so any
+  later movement is a left drag: a selection box on the map, or a normal drag inside UI widgets.
+- **Drag** (outside the slop before the hold timeout) → the right button goes down, which is the
+  Classic scroll button, so the camera pans. A pan that moves more than the 8 px scroll deadzone
+  keeps mouse focus on `ViewportControllerWidget`, so releasing it never reaches the world
+  interaction controller (no accidental selection).
+- Nothing is reported on the initial press itself: a left press would give mouse focus to
+  `WorldInteractionControllerWidget`, which then swallows the right-button events a pan needs.
+- Two fingers always mean "pan" (or "pinch" for zoom); the second finger closes whatever the
+  first one was doing so no button is left dangling.
 
 ## Engine modifications
 

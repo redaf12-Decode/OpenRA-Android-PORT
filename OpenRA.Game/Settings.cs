@@ -323,8 +323,14 @@ namespace OpenRA
 		public int ViewportEdgeScrollMargin = 5;
 
 		public bool LockMouseWindow = false;
-		public MouseControlStyle MouseControlStyle = MouseControlStyle.Modern;
-		public MouseScrollType MouseScroll = MouseScrollType.Joystick;
+		// A finger is not a mouse: touch input has no second button to split "select" from "order",
+		// so the Android port is mapped onto the Classic layout (left = contextual tap: select what is
+		// under the finger or give the order that point implies; left drag = selection box; right drag =
+		// camera scroll). Desktop keeps the Modern default.
+		public MouseControlStyle MouseControlStyle = OperatingSystem.IsAndroid() ? MouseControlStyle.Classic : MouseControlStyle.Modern;
+		// Touch drags should carry the map along with the finger, so the Android port scrolls with
+		// the "Standard" (grab and drag) style instead of the Tiberian Sun joystick style.
+		public MouseScrollType MouseScroll = OperatingSystem.IsAndroid() ? MouseScrollType.Standard : MouseScrollType.Joystick;
 		public float ViewportEdgeScrollStep = 30f;
 		public float UIScrollSpeed = 50f;
 		public float ZoomSpeed = 0.04f;

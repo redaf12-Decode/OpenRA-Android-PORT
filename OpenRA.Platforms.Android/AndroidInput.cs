@@ -20,33 +20,56 @@ namespace OpenRA.Platforms.Android
 {
 	// Translates Android MotionEvents (multi-touch) into OpenRA MouseInputs.
 	//
-	// Touch model:
-	//   - Single tap          = left click (with double-tap detection via MultiTapDetection)
-	//   - Long press (>500ms) = right-click (context menu, unit orders)
-	//   - Drag                = mouse move with left button held (scroll the map, drag-select)
-	//   - Two-finger pinch    = scroll/zoom (synthesized as MouseInputEvent.Scroll)
-	//   - Two-finger drag     = map pan (mouse move with right button held)
+	// A finger is not a mouse: there is no second button to split "select" from "order", so the
+	// gesture is resolved *before* any button is reported to the engine, which is then driven with
+	// the Classic mouse layout (see Settings.MouseControlStyle):
+	//
+	//   - Tap                    -> left press + release   Select what is under the finger, or give
+	//                                                     the order that point implies (move, attack,
+	//                                                     enter, repair, ...)
+	//   - Double-tap             -> left press + release   Select every unit of that type on screen
+	//                                 (MultiTapCount = 2)
+	//   - Press and hold, drag   -> left drag              Selection box; also drags UI widgets
+	//                                                     (sliders, scroll bars, minimap)
+	//   - Drag                   -> right drag             Pan the camera
+	//   - Two-finger drag        -> right drag             Pan the camera
+	//   - Two-finger pinch       -> MouseInputEvent.Scroll Zoom
+	//
+	// Nothing at all is reported on the initial press. Reporting a left press straight away would
+	// hand mouse focus to WorldInteractionControllerWidget, which then swallows the right-button
+	// events the camera pan needs (Ui.HandleInput routes events to the focused widget first).
 	sealed class AndroidInput
 	{
+		enum Gesture
+		{
+			Idle,       // no finger down
+			Pending,    // finger down, gesture not decided yet
+			Pan,        // right button held: dragging the camera
+			Select,     // left button held after a press-and-hold: selection box / UI drag
+			TwoFinger   // a second finger is down: it owns the camera pan
+		}
+
 		readonly ConcurrentQueue<PendingInput> pending = new();
 
-		// Primary finger state (left button).
+		// Primary finger state.
 		int primaryPointerId = -1;
 		int2 primaryDownPos;
+		int2 primaryLastPos;
 		Stopwatch primaryDownTimer;
 
-		// Secondary finger state (right button / pan).
+		// Secondary finger state (two-finger pan / pinch).
 		int secondaryPointerId = -1;
 
 		// Pinch state.
 		float lastPinchDist;
 
-		// Long-press detection threshold.
-		const int LongPressMs = 500;
+		// Press duration before the left button goes down (press and hold -> selection box).
+		const int HoldMs = 400;
+
+		// Movement that turns a press into a camera pan instead.
 		const int TouchSlopPx = 16;
 
-		// Suppresses the Up event when a long-press already fired a right-click.
-		bool longPressFired;
+		Gesture gesture = Gesture.Idle;
 
 		struct PendingInput
 		{
@@ -128,6 +151,28 @@ namespace OpenRA.Platforms.Android
 
 		int pinchDelta;
 
+		void BeginPan(IInputHandler h, int2 at)
+		{
+			h.OnMouseInput(new MouseInput(MouseInputEvent.Down, MouseButton.Right, at, int2.Zero, Modifiers.None, 1));
+
+			// Sync Viewport.LastMousePos so Standard (grab and drag) scrolling starts from the press
+			// point instead of wherever the pointer happened to be during the previous gesture.
+			h.OnMouseInput(new MouseInput(MouseInputEvent.Move, MouseButton.None, at, int2.Zero, Modifiers.None, 0));
+		}
+
+		void EndPan(IInputHandler h, int2 at)
+		{
+			h.OnMouseInput(new MouseInput(MouseInputEvent.Up, MouseButton.Right, at, int2.Zero, Modifiers.None, 1));
+		}
+
+		void EmitTap(IInputHandler h, int2 at)
+		{
+			// DetectFromMouse advances the tap history, so it must be called exactly once per tap.
+			var tapCount = MultiTapDetection.DetectFromMouse(0, at);
+			h.OnMouseInput(new MouseInput(MouseInputEvent.Down, MouseButton.Left, at, int2.Zero, Modifiers.None, tapCount));
+			h.OnMouseInput(new MouseInput(MouseInputEvent.Up, MouseButton.Left, at, int2.Zero, Modifiers.None, tapCount));
+		}
+
 		public void PumpInput(IInputHandler inputHandler, Size windowSize, Size surfaceSize, float scale)
 		{
 			while (pending.TryDequeue(out var p))
@@ -137,51 +182,64 @@ namespace OpenRA.Platforms.Android
 				switch (p.Action)
 				{
 					case MotionEventActions.Down:
+						// First finger down. Hold off on reporting anything until the gesture is known:
+						// a left press would give mouse focus to the world interaction controller and
+						// block the right-button events the camera pan needs.
 						primaryPointerId = p.PointerId;
 						primaryDownPos = pos;
+						primaryLastPos = pos;
 						primaryDownTimer = Stopwatch.StartNew();
-						longPressFired = false;
-						var tapCount = MultiTapDetection.DetectFromMouse(0, pos);
-						inputHandler.OnMouseInput(new MouseInput(MouseInputEvent.Down, MouseButton.Left, pos, int2.Zero, Modifiers.None, tapCount));
+						gesture = Gesture.Pending;
 						break;
 
 					case MotionEventActions.PointerDown:
-						if (secondaryPointerId < 0)
-						{
-							secondaryPointerId = p.PointerId;
-							lastPinchDist = 0;
+						if (secondaryPointerId >= 0)
+							break;
 
-							// If the primary finger is down, start a right-button drag (map pan).
-							if (primaryPointerId >= 0 && !longPressFired)
-							{
-								inputHandler.OnMouseInput(new MouseInput(MouseInputEvent.Down, MouseButton.Right, pos, int2.Zero, Modifiers.None, 1));
-							}
-						}
+						secondaryPointerId = p.PointerId;
+						lastPinchDist = 0;
 
+						// A second finger always means "pan". Close whatever the first finger was
+						// doing first so no button is left dangling, then make sure the right
+						// button is down (it is only already down when the first finger was panning).
+						if (gesture == Gesture.Select)
+							inputHandler.OnMouseInput(new MouseInput(MouseInputEvent.Up, MouseButton.Left, primaryLastPos, int2.Zero, Modifiers.None, 1));
+
+						if (gesture != Gesture.Pan)
+							BeginPan(inputHandler, gesture == Gesture.Idle ? pos : primaryDownPos);
+
+						gesture = Gesture.TwoFinger;
 						break;
 
 					case MotionEventActions.Move:
 						if (p.PointerId == primaryPointerId)
 						{
-							// Check for long-press (right-click) if the finger hasn't moved much.
-							if (!longPressFired && primaryDownTimer != null && primaryDownTimer.ElapsedMilliseconds > LongPressMs)
+							primaryLastPos = pos;
+
+							switch (gesture)
 							{
-								var moved = (pos - primaryDownPos).Length;
-								if (moved < TouchSlopPx)
-								{
-									longPressFired = true;
-									inputHandler.OnMouseInput(new MouseInput(MouseInputEvent.Up, MouseButton.Left, pos, int2.Zero, Modifiers.None, 1));
-									inputHandler.OnMouseInput(new MouseInput(MouseInputEvent.Down, MouseButton.Right, pos, int2.Zero, Modifiers.None, 1));
-								}
-							}
-							else
-							{
-								inputHandler.OnMouseInput(new MouseInput(MouseInputEvent.Move, MouseButton.Left, pos, int2.Zero, Modifiers.None, 0));
+								case Gesture.Pending:
+									// The finger moved before the hold timeout: this is a camera pan,
+									// not a tap and not a selection box.
+									if ((pos - primaryDownPos).Length > TouchSlopPx)
+									{
+										gesture = Gesture.Pan;
+										BeginPan(inputHandler, primaryDownPos);
+										inputHandler.OnMouseInput(new MouseInput(MouseInputEvent.Move, MouseButton.Right, pos, int2.Zero, Modifiers.None, 0));
+									}
+									break;
+
+								case Gesture.Pan:
+									inputHandler.OnMouseInput(new MouseInput(MouseInputEvent.Move, MouseButton.Right, pos, int2.Zero, Modifiers.None, 0));
+									break;
+
+								case Gesture.Select:
+									inputHandler.OnMouseInput(new MouseInput(MouseInputEvent.Move, MouseButton.Left, pos, int2.Zero, Modifiers.None, 0));
+									break;
 							}
 						}
-						else if (p.PointerId == secondaryPointerId && primaryPointerId >= 0)
+						else if (p.PointerId == secondaryPointerId && gesture == Gesture.TwoFinger)
 						{
-							// Two-finger pan: move with right button.
 							inputHandler.OnMouseInput(new MouseInput(MouseInputEvent.Move, MouseButton.Right, pos, int2.Zero, Modifiers.None, 0));
 						}
 
@@ -190,29 +248,56 @@ namespace OpenRA.Platforms.Android
 					case MotionEventActions.PointerUp:
 						if (p.PointerId == secondaryPointerId)
 						{
-							// End right-button drag.
-							if (primaryPointerId >= 0 && !longPressFired)
-								inputHandler.OnMouseInput(new MouseInput(MouseInputEvent.Up, MouseButton.Right, pos, int2.Zero, Modifiers.None, 1));
 							secondaryPointerId = -1;
 							lastPinchDist = 0;
+
+							// Another finger may still be down: it keeps panning on its own, otherwise
+							// this was the last finger and the pan has to be released here.
+							if (gesture == Gesture.TwoFinger)
+							{
+								if (primaryPointerId >= 0)
+									gesture = Gesture.Pan;
+								else
+								{
+									EndPan(inputHandler, pos);
+									gesture = Gesture.Idle;
+								}
+							}
+						}
+						else if (p.PointerId == primaryPointerId)
+						{
+							// The first finger lifted while the second is still down: the second
+							// finger keeps the pan alive (it becomes Android's primary pointer).
+							primaryPointerId = -1;
+							primaryDownTimer = null;
 						}
 
 						break;
 
 					case MotionEventActions.Up:
-						if (longPressFired)
+						// The last finger lifted.
+						switch (gesture)
 						{
-							// The long-press already sent a right-click Down; send the matching Up.
-							inputHandler.OnMouseInput(new MouseInput(MouseInputEvent.Up, MouseButton.Right, pos, int2.Zero, Modifiers.None, 1));
-						}
-						else
-						{
-							inputHandler.OnMouseInput(new MouseInput(MouseInputEvent.Up, MouseButton.Left, pos, int2.Zero, Modifiers.None, MultiTapDetection.InfoFromMouse(0)));
+							case Gesture.Pending:
+								EmitTap(inputHandler, pos);
+								break;
+
+							case Gesture.Select:
+								// Pressed and held without dragging far enough for a box: a click.
+								inputHandler.OnMouseInput(new MouseInput(MouseInputEvent.Up, MouseButton.Left, pos, int2.Zero, Modifiers.None, 1));
+								break;
+
+							case Gesture.Pan:
+							case Gesture.TwoFinger:
+								EndPan(inputHandler, pos);
+								break;
 						}
 
 						primaryPointerId = -1;
+						secondaryPointerId = -1;
 						primaryDownTimer = null;
-						longPressFired = false;
+						lastPinchDist = 0;
+						gesture = Gesture.Idle;
 						break;
 
 					case MotionEventActions.Scroll:
@@ -222,6 +307,18 @@ namespace OpenRA.Platforms.Android
 						pinchDelta = 0;
 						break;
 				}
+			}
+
+			// Android only reports Move events when the finger actually moves, so a stationary
+			// press-and-hold has to be detected from the frame pump rather than from the queue.
+			// This is the "press and hold, then drag" gesture: the left button goes down here and
+			// any later movement becomes a selection box (or a drag inside a UI widget).
+			if (gesture == Gesture.Pending && primaryDownTimer != null && secondaryPointerId < 0 &&
+				primaryDownTimer.ElapsedMilliseconds >= HoldMs &&
+				(primaryLastPos - primaryDownPos).Length < TouchSlopPx)
+			{
+				gesture = Gesture.Select;
+				inputHandler.OnMouseInput(new MouseInput(MouseInputEvent.Down, MouseButton.Left, primaryLastPos, int2.Zero, Modifiers.None, 1));
 			}
 		}
 	}
